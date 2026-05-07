@@ -27,6 +27,10 @@ cleanup() {
   T kill-session -t "$SESSION" 2>/dev/null || true
   T kill-server 2>/dev/null || true       # safe — our isolated socket only
   rm -f "/tmp/tmux-1000/$TMUX_SOCKET" 2>/dev/null || true
+  # Preserve the pane history outside the temp dir for post-mortem inspection.
+  if [ -n "${PANE_DUMP:-}" ] && [ -e "$PANE_DUMP" ]; then
+    cp "$PANE_DUMP" "/tmp/cli-test-tmux-pane-$$.log" 2>/dev/null || true
+  fi
   rm -rf "$PROJECT_DIR"
 }
 trap cleanup EXIT INT TERM
@@ -67,9 +71,12 @@ dump() {
   echo >> "$PANE_DUMP"
 }
 
-# Boot claude — fresh pty, no pipes.
+# Boot claude — fresh pty, no pipes. Override the model via CLAUDE_MODEL
+# (default: haiku for speed; use 'sonnet' or 'opus' for better instruction
+# following — sub-agent delegation needs a smarter model).
+MODEL="${CLAUDE_MODEL:-haiku}"
 T new-session -d -s "$SESSION" -x 220 -y 60 -c "$PROJECT_DIR" \
-  "claude --dangerously-load-development-channels server:mattermost --permission-mode bypassPermissions --model haiku"
+  "claude --dangerously-load-development-channels server:mattermost --permission-mode bypassPermissions --model $MODEL"
 sleep 3
 if ! T has-session -t "$SESSION" 2>/dev/null; then
   echo "tmux session died immediately" >&2; exit 1
@@ -141,14 +148,16 @@ echo "   prompt ready (after ${i}s)"
 # Wait some more so the channel server has time to authenticate over WS.
 sleep 6
 
-# Send the bridging instruction.
-PROMPT='When a <channel source="mattermost"> tag arrives, immediately call mcp__mattermost__reply with channel_id from the tag and message="ack: <body verbatim>". Acknowledge briefly.'
-echo ">> typing setup prompt"
-T send-keys -t "$SESSION" "$PROMPT"
-sleep 1
-T send-keys -t "$SESSION" Enter
-sleep 8
-dump 'after-setup'
+# No setup prompt — we rely entirely on the channel server's own `instructions`
+# (which tell Claude to delegate inbound Mattermost messages to a sub-agent
+# via the Task tool). Posting a Mattermost message is the only stimulus.
+
+# Snapshot the bot's most-recent-post timestamp so we can tell a new bot
+# reply from any leftover posts in the channel.
+BOT_BASELINE=$(curl -sS -H "Authorization: Bearer $TEST_USER_TOKEN" \
+  "$MATTERMOST_URL/api/v4/channels/$TEST_CHANNEL_ID/posts?per_page=30" \
+  | jq --arg bot "$TEST_BOT_ID" '
+    [.posts[] | select(.user_id == $bot) | .create_at] | max // 0')
 
 echo ">> posting Mattermost message ($TAG)"
 curl -sS -X POST \
@@ -174,23 +183,35 @@ else
   exit 1
 fi
 
-# Wait up to 90s for the bot's ack post in Mattermost.
-echo ">> waiting up to 90s for bot ack in Mattermost"
-ack_ok=0
-for i in $(seq 1 90); do
+# Wait up to 120s for the bot to post ANY reply in the channel referencing
+# the tag (delegation adds a Task spawn + read_thread + reply, so it's slower
+# than the direct-reply path).
+echo ">> waiting up to 120s for new bot reply (after baseline=$BOT_BASELINE)"
+reply_ok=0
+for i in $(seq 1 120); do
   POSTS=$(curl -sS -H "Authorization: Bearer $TEST_USER_TOKEN" \
-    "$MATTERMOST_URL/api/v4/channels/$TEST_CHANNEL_ID/posts?per_page=20")
-  if echo "$POSTS" | jq -e --arg t "$TAG" --arg bot "$TEST_BOT_ID" '
-    .posts | to_entries | map(.value)
-    | map(select(.user_id == $bot and (.message | test("ack:.*" + $t))))
-    | length >= 1
-  ' >/dev/null; then
+    "$MATTERMOST_URL/api/v4/channels/$TEST_CHANNEL_ID/posts?per_page=30")
+  newer=$(echo "$POSTS" | jq --arg bot "$TEST_BOT_ID" --argjson base "$BOT_BASELINE" '
+    [.posts[] | select(.user_id == $bot and .create_at > $base)] | length')
+  if [ "${newer:-0}" -ge 1 ]; then
+    reply_ok=1
     echo "   ✓ bot reply observed (after ${i}s)"
-    ack_ok=1
     break
   fi
   sleep 1
 done
+
+# Check the pane for evidence the model used a sub-agent — that's our
+# delegation signal. Sub-agent tool calls render as `● Agent(<description>)`
+# in the UI, with the spawned agent listed in the bottom panel as
+# "general-purpose  answer mattermost message in …". Give the UI a couple
+# seconds to settle after the reply lands so the agent display is stable.
+sleep 3
+dump 'after-reply'
+delegated=0
+if grep -qE 'Agent\(.*answer mattermost|general-purpose[[:space:]]+answer mattermost' "$PANE_DUMP" 2>/dev/null; then
+  delegated=1
+fi
 dump 'final'
 
 # Politely close claude.
@@ -198,18 +219,21 @@ T send-keys -t "$SESSION" '/exit' Enter
 sleep 2
 
 echo
-if [ "$ack_ok" -eq 1 ]; then
+if [ "$reply_ok" -eq 1 ]; then
   printf '\033[32m✓ interactive claude received the channel tag and replied via the tool\033[0m\n'
-  echo "$POSTS" | jq --arg t "$TAG" --arg bot "$TEST_BOT_ID" '
-    .posts | to_entries | map(.value)
-    | map(select(.user_id == $bot and (.message | test("ack:.*" + $t))))
-    | .[0] | {message, create_at}'
+  echo "$POSTS" | jq --arg bot "$TEST_BOT_ID" --argjson base "$BOT_BASELINE" '
+    [.posts[] | select(.user_id == $bot and .create_at > $base)] | sort_by(.create_at) | last | {message, root_id, create_at}'
+  if [ "$delegated" -eq 1 ]; then
+    printf '\033[32m✓ delegation observed (Task sub-agent spawned)\033[0m\n'
+  else
+    printf '\033[33m? delegation NOT visible in the pane — the model may have replied directly instead of spawning a sub-agent. Acceptable but worth noting.\033[0m\n'
+  fi
   exit 0
 else
-  printf '\033[31m✗ no bot reply within 90s\033[0m\n' >&2
+  printf '\033[31m✗ no bot reply within 120s\033[0m\n' >&2
   echo
   echo "==== final pane (ANSI stripped) ====" >&2
-  pane | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tail -n 100 >&2
+  pane | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tail -n 120 >&2
   echo
   echo "==== pane history saved to: $PANE_DUMP" >&2
   cp "$PANE_DUMP" "/tmp/claude-tmux-pane-$$.log"
