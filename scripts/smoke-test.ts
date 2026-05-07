@@ -155,11 +155,12 @@ async function main() {
   await client.connect(transport)
   console.log('connected to channel server\n')
 
-  // 1. ListTools — server exposes reply + confirm_pairing
-  await step('lists reply and confirm_pairing tools', async () => {
+  // 1. ListTools — server exposes the four tools
+  await step('lists reply, confirm_pairing, read_thread, clear_thread_state', async () => {
     const { tools } = await client.listTools()
     const names = tools.map(t => t.name).sort()
-    if (JSON.stringify(names) !== JSON.stringify(['confirm_pairing', 'reply'])) {
+    const expected = ['clear_thread_state', 'confirm_pairing', 'read_thread', 'reply']
+    if (JSON.stringify(names) !== JSON.stringify(expected)) {
       throw new Error(`unexpected tools: ${names.join(', ')}`)
     }
   })
@@ -381,7 +382,71 @@ async function main() {
     }
   })
 
-  // 10. Thread tracking persists across server restart.
+  // 10. read_thread returns thread history rendered as text
+  await step('read_thread returns thread history', async () => {
+    const mentionsChan = env.TEST_MENTIONS_CHANNEL_ID!
+    const root = await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: 'parent post for read_thread' })
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: 'first reply', root_id: root.id })
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: 'second reply', root_id: root.id })
+
+    const r = await client.callTool({
+      name: 'read_thread', arguments: { root_id: root.id },
+    }) as { content: { text?: string }[]; isError?: boolean }
+    if (r.isError) throw new Error('read_thread returned isError')
+    const body = r.content[0]?.text ?? ''
+    for (const needle of ['parent post for read_thread', 'first reply', 'second reply', '@alice']) {
+      if (!body.includes(needle)) throw new Error(`read_thread output missing "${needle}":\n${body}`)
+    }
+  })
+
+  // 11. clear_thread_state removes a thread from the tracked set
+  await step('clear_thread_state stops auto-forwarding for that thread', async () => {
+    const mentionsChan = env.TEST_MENTIONS_CHANNEL_ID!
+    const botName = env.TEST_BOT_USERNAME!
+
+    inbox.length = 0
+    const tag = `smoke-clear-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: `@${botName} ${tag}` })
+    const note = await waitFor(() => inbox.find(n => n.content.includes(tag)), 8000, 'mention forward')
+    const rootId = note.meta?.post_id!
+    await client.callTool({
+      name: 'reply',
+      arguments: { channel_id: mentionsChan, message: `bot reply to ${tag}`, root_id: rootId },
+    })
+    await delay(1500)
+
+    // Verify it would forward without the clear:
+    inbox.length = 0
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: `pre-clear ${tag}`, root_id: rootId })
+    await waitFor(() => inbox.find(n => n.content === `pre-clear ${tag}`), 8000, 'pre-clear forward')
+
+    // Now clear:
+    const r = await client.callTool({
+      name: 'clear_thread_state', arguments: { root_id: rootId },
+    }) as { content: { text?: string }[]; isError?: boolean }
+    if (r.isError) throw new Error('clear_thread_state returned isError')
+    if (!String(r.content[0]?.text ?? '').startsWith('cleared')) {
+      throw new Error(`clear_thread_state unexpected output: ${r.content[0]?.text}`)
+    }
+
+    // Follow-up should now NOT forward (no mention, thread no longer tracked):
+    inbox.length = 0
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: `post-clear ${tag}`, root_id: rootId })
+    const leaked = await Promise.race([
+      delay(2500).then(() => false),
+      waitFor(() => inbox.find(n => n.content === `post-clear ${tag}`), 2000, 'leaked').then(() => true).catch(() => false),
+    ])
+    if (leaked) throw new Error('post-clear follow-up was forwarded — clear_thread_state did not stick')
+  })
+
+  // 12. Thread tracking persists across server restart. (Must run last; it
+  // closes the original client/transport and spawns a new one.)
   await step('bot-thread tracking survives a server restart', async () => {
     const mentionsChan = env.TEST_MENTIONS_CHANNEL_ID!
     const botName = env.TEST_BOT_USERNAME!

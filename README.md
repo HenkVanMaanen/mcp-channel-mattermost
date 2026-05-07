@@ -229,6 +229,27 @@ Every forwarded post arrives in Claude's context as:
 Tag attribute keys must be identifiers — letters, digits, underscores. Hyphens
 are stripped by the Claude Code framework, so this server avoids them.
 
+## Long-running use: sub-agent delegation
+
+If you want to run this as a 24/7 Mattermost bot, the main Claude session's
+context will accumulate every channel event and start to feel sluggish — so
+the channel's `instructions` tell Claude to **delegate every inbound message
+to a sub-agent via the Task tool**. The sub-agent has its own fresh context,
+calls `read_thread` for prior messages, formulates a reply, calls `reply` to
+post it, and exits. The main session only sees a one-line "delegated, done"
+trace per message — context growth stays bounded so a `/compact` (or just
+patience) keeps you running for a long time.
+
+You don't need to do anything to opt in — Claude reads the delegation
+instruction at startup and follows it. Pairing codes (`pair ABC123`) and
+permission verdicts (`yes <id>` / `no <id>`) are NOT delegated; they're
+handled in the main session (or, for verdicts, by the channel server before
+Claude sees them).
+
+To "close" a Mattermost conversation so future replies in that thread no
+longer auto-forward, ask Claude to call `clear_thread_state` with the
+`root_id`. The thread becomes inert until someone @mentions the bot again.
+
 ## Tools
 
 ### `reply`
@@ -239,6 +260,26 @@ reply({ channel_id, message, root_id? })
 
 Posts a message back to Mattermost. To reply in-thread, pass `root_id` (use
 `root_id` from the inbound tag if non-empty, otherwise `post_id`).
+
+### `read_thread`
+
+```ts
+read_thread({ root_id })
+```
+
+Returns the full message history of a Mattermost thread, formatted as
+`@user (timestamp): message` lines in chronological order. Sub-agents
+spawned per inbound message call this first to get conversation context.
+
+### `clear_thread_state`
+
+```ts
+clear_thread_state({ root_id })
+```
+
+Removes a thread root_id from the channel server's tracked-threads set so
+follow-up replies in that thread no longer auto-forward without an @mention.
+The persisted state file is updated.
 
 ### `confirm_pairing`
 

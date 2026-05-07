@@ -1,6 +1,6 @@
 {
   "name": "mattermost",
   "description": "Mattermost channel for Claude Code — chat bridge with reply tool, sender allowlist, pairing flow, and permission relay.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "keywords": ["mattermost", "messaging", "channel", "mcp"]
 }

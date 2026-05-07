@@ -133,6 +133,32 @@ async function openDirectChannel(otherUserId: string): Promise<MMChannel> {
   })
 }
 
+type MMThread = { order: string[]; posts: Record<string, MMPost> }
+
+async function getThread(rootId: string): Promise<MMThread> {
+  return mm<MMThread>(`/posts/${rootId}/thread`)
+}
+
+async function getUsersByIds(ids: string[]): Promise<MMUser[]> {
+  if (ids.length === 0) return []
+  return mm<MMUser[]>('/users/ids', { method: 'POST', body: JSON.stringify(ids) })
+}
+
+async function renderThread(rootId: string): Promise<string> {
+  const t = await getThread(rootId)
+  const order = [...t.order].sort((a, b) => (t.posts[a]!.create_at ?? 0) - (t.posts[b]!.create_at ?? 0))
+  const userIds = Array.from(new Set(order.map(id => t.posts[id]!.user_id)))
+  const users = await getUsersByIds(userIds).catch(() => [] as MMUser[])
+  const nameOf = new Map(users.map(u => [u.id, u.username]))
+  const lines = order.map(id => {
+    const p = t.posts[id]!
+    const handle = nameOf.get(p.user_id) ?? p.user_id
+    const ts = new Date(p.create_at).toISOString().slice(0, 19).replace('T', ' ')
+    return `@${handle} (${ts}): ${p.message}`
+  })
+  return `Thread root=${rootId} (${order.length} message${order.length === 1 ? '' : 's'}):\n\n${lines.join('\n\n')}`
+}
+
 const MM_ID_RE = /^[a-z0-9]{26}$/
 
 async function resolveUserId(usernameOrId: string): Promise<string | null> {
@@ -223,7 +249,7 @@ function purgeExpiredPairings() {
 // --- MCP server ------------------------------------------------------------
 
 const mcp = new Server(
-  { name: 'mattermost', version: '0.1.0' },
+  { name: 'mattermost', version: '0.2.0' },
   {
     capabilities: {
       experimental: {
@@ -232,15 +258,30 @@ const mcp = new Server(
       },
       tools: {},
     },
-    instructions:
-      'Mattermost messages arrive as <channel source="mattermost" channel_id="..." ' +
-      'channel_type="D|O|P|G" channel_name="..." user_id="..." username="..." ' +
-      'post_id="..." root_id="...">. ' +
-      'Reply with the `reply` tool, passing channel_id from the tag. ' +
-      'To keep the reply threaded, also pass root_id (use the inbound root_id if non-empty, otherwise post_id). ' +
-      'channel_type "D" is a direct message, "O" public channel, "P" private, "G" group DM. ' +
-      'If the operator types a 6-character pairing code (e.g. "pair ABC123"), call ' +
-      'confirm_pairing with that code to authorize a new Mattermost user.',
+    instructions: [
+      'Mattermost posts arrive as <channel source="mattermost" channel_id="..."',
+      'channel_type="D|O|P|G" channel_name="..." user_id="..." username="..."',
+      'post_id="..." root_id="...">. channel_type: D=direct, O=public, P=private, G=group DM.',
+      '',
+      'Long-running use — DELEGATE every inbound Mattermost message to a sub-agent',
+      'via the Task tool so this main session\'s context stays bounded. Spawn:',
+      '  subagent_type: general-purpose',
+      '  description:    "answer mattermost message in #<channel_name or DM>"',
+      '  prompt:         "You are answering a Mattermost message. channel_id=<from tag>,',
+      '                   root_id=<inbound root_id if non-empty else post_id>.',
+      '                   Call mcp__mattermost__read_thread first for full thread context,',
+      '                   formulate your answer, then call mcp__mattermost__reply with',
+      '                   that channel_id and root_id. Keep replies concise."',
+      'After Task returns, do NOT re-analyze or restate the message in this session.',
+      '',
+      'Exceptions handled in this session (do not delegate):',
+      ' - 6-character pairing codes ("pair ABC123") → call mcp__mattermost__confirm_pairing',
+      ' - Permission-relay verdicts ("yes <id>" / "no <id>") → handled by the channel',
+      '   server before they reach you, you will not see them as channel events',
+      '',
+      'To "close" a Mattermost conversation so future replies in that thread stop',
+      'auto-forwarding, call mcp__mattermost__clear_thread_state with the root_id.',
+    ].join('\n'),
   },
 )
 
@@ -274,6 +315,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           code: { type: 'string', description: '6-character pairing code provided by the user' },
         },
         required: ['code'],
+      },
+    },
+    {
+      name: 'read_thread',
+      description:
+        'Read the full message history of a Mattermost thread. Call this from a sub-agent ' +
+        'BEFORE formulating a reply, so the agent has context for prior messages. Pass the ' +
+        'root_id from the inbound <channel> tag (use inbound root_id if non-empty, otherwise post_id). ' +
+        'Returns posts in chronological order, each prefixed with @username and an ISO timestamp.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          root_id: { type: 'string', description: 'Thread root post ID (26-char Mattermost ID)' },
+        },
+        required: ['root_id'],
+      },
+    },
+    {
+      name: 'clear_thread_state',
+      description:
+        'Forget that the bot has participated in this thread. After this, replies in the thread ' +
+        'will only be forwarded to Claude if the user @mentions the bot again or the channel is ' +
+        'in MATTERMOST_LISTEN_CHANNELS. Use to "close" a conversation that\'s no longer active.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          root_id: { type: 'string', description: '26-char Mattermost thread root post ID' },
+        },
+        required: ['root_id'],
       },
     },
   ],
@@ -322,6 +392,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       console.error('post-pairing notification failed:', (e as Error).message)
     }
     return { content: [{ type: 'text', text: `authorized ${label}` }] }
+  }
+
+  if (name === 'read_thread') {
+    const root_id = String(args.root_id ?? '')
+    if (!root_id) {
+      return { content: [{ type: 'text', text: 'root_id is required' }], isError: true }
+    }
+    try {
+      const text = await renderThread(root_id)
+      return { content: [{ type: 'text', text }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: `read_thread failed: ${(e as Error).message}` }], isError: true }
+    }
+  }
+
+  if (name === 'clear_thread_state') {
+    const root_id = String(args.root_id ?? '')
+    if (!root_id) {
+      return { content: [{ type: 'text', text: 'root_id is required' }], isError: true }
+    }
+    const had = botThreads.delete(root_id)
+    if (had) scheduleSave()
+    return { content: [{ type: 'text', text: had ? `cleared ${root_id}` : `${root_id} was not tracked` }] }
   }
 
   throw new Error(`unknown tool: ${name}`)
