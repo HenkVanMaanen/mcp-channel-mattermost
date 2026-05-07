@@ -1,0 +1,31 @@
+{
+  "name": "mcp-channel-mattermost",
+  "version": "0.1.0",
+  "description": "Claude Code MCP channel that bridges a Mattermost bot into your session",
+  "type": "module",
+  "bin": "./mattermost.ts",
+  "scripts": {
+    "start": "bun install --no-summary && bun mattermost.ts",
+    "start:node": "tsx mattermost.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke-test.ts",
+    "cli-test": "bash scripts/cli-test.sh",
+    "cli-test:inbound": "bash scripts/cli-test-inbound.sh",
+    "cli-test:tmux": "bash scripts/cli-test-tmux.sh",
+    "mm:up": "docker compose -f docker-compose.dev.yml -p mmtest up -d",
+    "mm:down": "docker compose -f docker-compose.dev.yml -p mmtest down -v",
+    "mm:setup": "bash scripts/setup-mattermost.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+bun.lock
+bun.lockb
+.env
+.env.local
+.smoke-state.json
+.cli-test-state.json
+.cli-test-channel.log
+.cli-test-channel-dump.md
+*.log

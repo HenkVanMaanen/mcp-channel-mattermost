@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: mmuser
+      POSTGRES_PASSWORD: mmuser_password
+      POSTGRES_DB: mattermost
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mmuser", "-d", "mattermost"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - mm-pgdata:/var/lib/postgresql/data
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:10.12.4
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8065:8065"
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://mmuser:mmuser_password@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
+      MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+      MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_PASSWORDSETTINGS_MINIMUMLENGTH: "5"
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_PLUGINSETTINGS_AUTOMATICPREPACKAGEDPLUGINS: "false"
+    volumes:
+      - mm-config:/mattermost/config
+      - mm-data:/mattermost/data
+      - mm-logs:/mattermost/logs
+      - mm-plugins:/mattermost/plugins
+      - mm-client-plugins:/mattermost/client/plugins
+      - mm-bleve-indexes:/mattermost/bleve-indexes
+
+volumes:
+  mm-pgdata:
+  mm-config:
+  mm-data:
+  mm-logs:
+  mm-plugins:
+  mm-client-plugins:
+  mm-bleve-indexes:

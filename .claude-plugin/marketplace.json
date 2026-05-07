@@ -1,0 +1,16 @@
+{
+  "name": "mcp-channel-mattermost",
+  "owner": {
+    "name": "henkvanmaanen",
+    "url": "https://github.com/henkvanmaanen"
+  },
+  "metadata": {
+    "description": "Single-plugin marketplace exposing the Mattermost channel for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "mattermost",
+      "source": "."
+    }
+  ]
+}

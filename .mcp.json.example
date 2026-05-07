@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "mattermost": {
+      "command": "bun",
+      "args": ["./mattermost.ts"],
+      "env": {
+        "MATTERMOST_URL": "https://mattermost.example.com",
+        "MATTERMOST_TOKEN": "replace-with-bot-personal-access-token",
+        "MATTERMOST_TEAM": "myteam",
+        "MATTERMOST_ALLOWED_USERS": "alice,bob",
+        "MATTERMOST_LISTEN_CHANNELS": "ops-alerts"
+      }
+    }
+  }
+}
