@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "mattermost",
-      "source": "."
+      "source": "./"
     }
   ]
 }
