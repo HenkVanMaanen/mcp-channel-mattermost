@@ -14,6 +14,7 @@ Tested against Mattermost **10.12.4** (Team Edition).
 - Forward inbound posts to Claude:
   - DMs to the bot
   - `@bot` mentions in any channel the bot is a member of
+  - **Thread follow-ups**: replies in any thread the bot has already posted in are forwarded automatically — the user doesn't have to `@bot` again. Tracking persists across channel-server restarts via the state file.
   - Every post in channels listed via `MATTERMOST_LISTEN_CHANNELS` (alerts, ops rooms)
 - Two-way: `reply` MCP tool posts back to a channel/DM, optional `root_id` for threading
 - Permission relay: tool-use prompts (`Bash`, `Write`, `Edit`, …) are DMed to allowed users; reply `yes <id>` / `no <id>` to approve or deny

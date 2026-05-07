@@ -30,6 +30,7 @@ const required = [
   'MATTERMOST_ALLOWED_USERS', 'MATTERMOST_LISTEN_CHANNELS',
   'TEST_USER_TOKEN', 'TEST_USER_ID', 'TEST_BOT_ID',
   'TEST_TEAM_ID', 'TEST_CHANNEL_ID',
+  'TEST_BOT_USERNAME', 'TEST_MENTIONS_CHANNEL_ID',
 ]
 for (const k of required) {
   if (!env[k]) throw new Error(`missing ${k} in ${envPath} — re-run scripts/setup-mattermost.sh`)
@@ -137,7 +138,7 @@ const transport = new StdioClientTransport({
 // Mirror server stderr so we can see ws / api errors live during the run.
 transport.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`[server] ${chunk}`))
 
-const client = new Client(
+let client = new Client(
   { name: 'smoke-test', version: '0.0.0' },
   { capabilities: {} },
 )
@@ -327,6 +328,111 @@ async function main() {
       { channel_id: bobDm.id, message: 'hi again from bob' })
     await waitFor(() => inbox.find(n => n.content === 'hi again from bob'), 8000,
       'post-pairing forward')
+  })
+
+  // 9. Thread follow-up in a channel that is NOT in MATTERMOST_LISTEN_CHANNELS
+  //    and where the user does NOT @mention the bot in the follow-up.
+  await step('thread follow-up forwards without re-mention', async () => {
+    const mentionsChan = env.TEST_MENTIONS_CHANNEL_ID!
+    const botName = env.TEST_BOT_USERNAME!
+
+    // a) bare post (no mention) should NOT forward
+    inbox.length = 0
+    const baseTag = `smoke-bare-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: baseTag })
+    const leaked = await Promise.race([
+      delay(2500).then(() => false),
+      waitFor(() => inbox.find(n => n.content === baseTag), 2000, 'leak').then(() => true).catch(() => false),
+    ])
+    if (leaked) throw new Error('non-mentioned, non-watched post was forwarded')
+
+    // b) @mention starts the conversation
+    inbox.length = 0
+    const mentionTag = `smoke-mention-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: `@${botName} ${mentionTag}` })
+    const mentionNote = await waitFor(
+      () => inbox.find(n => n.content.includes(mentionTag)),
+      8000, 'mention forward')
+    const rootId = mentionNote.meta?.post_id
+    if (!rootId) throw new Error('mention note missing post_id')
+
+    // c) bot replies in the thread via the reply tool
+    const botReply = `bot-reply-${Date.now()}`
+    await client.callTool({
+      name: 'reply',
+      arguments: { channel_id: mentionsChan, message: botReply, root_id: rootId },
+    })
+    // wait for the bot's post to come back over WS so the server tracks the thread
+    await delay(1500)
+
+    // d) user follows up in the same thread WITHOUT mentioning the bot
+    inbox.length = 0
+    const followupTag = `smoke-followup-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts', {
+      channel_id: mentionsChan, message: followupTag, root_id: rootId,
+    })
+    const followNote = await waitFor(
+      () => inbox.find(n => n.content === followupTag), 8000,
+      'thread follow-up forward')
+    if (followNote.meta?.root_id !== rootId) {
+      throw new Error(`follow-up root_id mismatch: ${followNote.meta?.root_id} vs ${rootId}`)
+    }
+  })
+
+  // 10. Thread tracking persists across server restart.
+  await step('bot-thread tracking survives a server restart', async () => {
+    const mentionsChan = env.TEST_MENTIONS_CHANNEL_ID!
+    const botName = env.TEST_BOT_USERNAME!
+
+    // Establish a thread the bot is part of, in this run.
+    inbox.length = 0
+    const tag = `smoke-restart-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts',
+      { channel_id: mentionsChan, message: `@${botName} ${tag}` })
+    const note = await waitFor(() => inbox.find(n => n.content.includes(tag)), 8000, 'restart-mention')
+    const rootId = note.meta?.post_id!
+    await client.callTool({
+      name: 'reply',
+      arguments: { channel_id: mentionsChan, message: `bot-reply-${tag}`, root_id: rootId },
+    })
+    await delay(1500)  // let the bot's post echo back over WS
+
+    // Restart the channel server: close the old client/transport, spin up a new pair.
+    await client.close()
+    const newTransport = new StdioClientTransport({
+      command: 'npx',
+      args: ['tsx', resolve(import.meta.dirname, '..', 'mattermost.ts')],
+      env: {
+        ...process.env,
+        MATTERMOST_URL: env.MATTERMOST_URL!,
+        MATTERMOST_TOKEN: env.MATTERMOST_TOKEN!,
+        MATTERMOST_TEAM: env.MATTERMOST_TEAM!,
+        MATTERMOST_ALLOWED_USERS: env.MATTERMOST_ALLOWED_USERS!,
+        MATTERMOST_LISTEN_CHANNELS: env.MATTERMOST_LISTEN_CHANNELS!,
+        MATTERMOST_STATE_FILE: resolve(import.meta.dirname, '..', '.smoke-state.json'),
+      },
+      stderr: 'pipe',
+    })
+    newTransport.stderr?.on('data', (chunk: Buffer) => process.stderr.write(`[server2] ${chunk}`))
+    const newClient = new Client({ name: 'smoke-test', version: '0.0.0' }, { capabilities: {} })
+    const inbox2: ChannelNotification['params'][] = []
+    newClient.setNotificationHandler(ChannelNotification, async n => { inbox2.push(n.params) })
+    await newClient.connect(newTransport)
+    await delay(2500)  // ws auth + allowlist resolution
+
+    // User replies in the SAME thread (no mention) — fresh process, fresh
+    // memory, but state file should have remembered the thread root_id.
+    const tagAfter = `smoke-restart-after-${Date.now()}`
+    await mmAs(env.TEST_USER_TOKEN!, 'POST', '/posts', {
+      channel_id: mentionsChan, message: tagAfter, root_id: rootId,
+    })
+    await waitFor(() => inbox2.find(n => n.content === tagAfter), 8000,
+      'thread follow-up forwards after restart')
+
+    // Reattach `client` so the .finally() cleanup closes the right one.
+    client = newClient
   })
 }
 

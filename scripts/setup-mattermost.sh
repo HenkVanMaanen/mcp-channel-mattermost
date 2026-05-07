@@ -23,6 +23,7 @@ TEST_USER="${TEST_USER:-alice}"
 TEST_EMAIL="${TEST_EMAIL:-alice@example.com}"
 TEST_PASS="${TEST_PASS:-alice12345}"
 TEST_CHANNEL="${TEST_CHANNEL:-ops-alerts}"
+MENTIONS_CHANNEL="${MENTIONS_CHANNEL:-mentions-only}"
 
 api() {
   local method="$1" path="$2" body="${3:-}" auth="${4:-}"
@@ -135,6 +136,23 @@ for u in "$BOT_ID" "$USER_ID"; do
     "$(jq -nc --arg u "$u" '{user_id:$u}')" "$ADMIN_TOKEN" >/dev/null || true
 done
 
+note "Ensuring channel $MENTIONS_CHANNEL (not in MATTERMOST_LISTEN_CHANNELS — for mention/thread-tracking tests)"
+MCHAN=$(api GET "/teams/$TEAM_ID/channels/name/$MENTIONS_CHANNEL" "" "$ADMIN_TOKEN")
+MCHAN_ID=$(echo "$MCHAN" | jq -r 'select(.name) | .id // empty')
+if [ -z "$MCHAN_ID" ]; then
+  CREATED=$(api POST /channels \
+    "$(jq -nc --arg t "$TEAM_ID" --arg n "$MENTIONS_CHANNEL" \
+       '{team_id:$t, name:$n, display_name:"Mentions Only", type:"O"}')" "$ADMIN_TOKEN")
+  MCHAN_ID=$(echo "$CREATED" | jq -r '.id // empty')
+  if [ -z "$MCHAN_ID" ]; then echo "mentions channel create failed: $CREATED" >&2; exit 1; fi
+fi
+ok "mentions_channel_id=$MCHAN_ID"
+
+for u in "$BOT_ID" "$USER_ID"; do
+  api POST "/channels/$MCHAN_ID/members" \
+    "$(jq -nc --arg u "$u" '{user_id:$u}')" "$ADMIN_TOKEN" >/dev/null || true
+done
+
 note "Login token for test user"
 TEST_TOKEN=$(login_token "$TEST_USER" "$TEST_PASS")
 if [ -z "$TEST_TOKEN" ]; then echo "test user login failed" >&2; exit 1; fi
@@ -155,6 +173,8 @@ TEST_USER_ID=$USER_ID
 TEST_BOT_ID=$BOT_ID
 TEST_TEAM_ID=$TEAM_ID
 TEST_CHANNEL_ID=$CHAN_ID
+TEST_BOT_USERNAME=$BOT_USER
+TEST_MENTIONS_CHANNEL_ID=$MCHAN_ID
 EOF
 ok "wrote $ENV_PATH"
 

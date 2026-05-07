@@ -46,21 +46,39 @@ function dbg(...args: unknown[]) {
 
 // --- Persistent state ------------------------------------------------------
 
-type State = { approved_user_ids: string[] }
+type State = {
+  approved_user_ids: string[]
+  bot_thread_ids: string[]
+}
 
 async function loadState(): Promise<State> {
   try {
     const raw = await readFile(STATE_FILE, 'utf8')
     const parsed = JSON.parse(raw)
-    return { approved_user_ids: Array.isArray(parsed.approved_user_ids) ? parsed.approved_user_ids : [] }
+    return {
+      approved_user_ids: Array.isArray(parsed.approved_user_ids) ? parsed.approved_user_ids : [],
+      bot_thread_ids: Array.isArray(parsed.bot_thread_ids) ? parsed.bot_thread_ids : [],
+    }
   } catch {
-    return { approved_user_ids: [] }
+    return { approved_user_ids: [], bot_thread_ids: [] }
   }
 }
 
-async function saveState(s: State) {
+async function saveStateNow(s: State) {
   await mkdir(dirname(STATE_FILE), { recursive: true })
   await writeFile(STATE_FILE, JSON.stringify(s, null, 2))
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleSave() {
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    saveStateNow({
+      approved_user_ids: [...approvedIds],
+      bot_thread_ids: [...botThreads],
+    }).catch(e => console.error('saveState:', (e as Error).message))
+  }, 500)
 }
 
 // --- Mattermost REST helpers -----------------------------------------------
@@ -154,6 +172,9 @@ console.error(`mattermost channel: authenticated as @${botUsername} (${botId}) a
 
 const persisted = await loadState()
 const approvedIds = new Set<string>(persisted.approved_user_ids)
+// Threads the bot has participated in (loaded from disk so restarts don't
+// drop in-progress conversations). See `botThreads` usage in handlePosted.
+const botThreads = new Set<string>(persisted.bot_thread_ids)
 const staticAllowedIds = new Set<string>()
 for (const v of ALLOWED_USERS) {
   const id = await resolveUserId(v)
@@ -286,7 +307,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
     pendingPairings.delete(code)
     approvedIds.add(pending.user_id)
-    await saveState({ approved_user_ids: [...approvedIds] })
+    scheduleSave()
 
     let label = pending.user_id
     try {
@@ -402,7 +423,20 @@ async function handlePosted(msg: any) {
   if (typeof d.post !== 'string') return
   const post = JSON.parse(d.post) as MMPost
 
-  if (post.user_id === botId) return
+  if (post.user_id === botId) {
+    // Bot's own post: track its thread so future replies in it are forwarded
+    // (without requiring the user to @mention again). post.id is the implicit
+    // thread root for top-level posts; post.root_id (if set) is the existing
+    // thread we joined. Persisted via scheduleSave() so restarts don't drop
+    // in-progress conversations.
+    let changed = false
+    if (!botThreads.has(post.id)) { botThreads.add(post.id); changed = true }
+    if (post.root_id && !botThreads.has(post.root_id)) {
+      botThreads.add(post.root_id); changed = true
+    }
+    if (changed) scheduleSave()
+    return
+  }
   if (post.type && post.type !== '') return
 
   const channelType: string = d.channel_type ?? ''
@@ -415,8 +449,9 @@ async function handlePosted(msg: any) {
   const isDM = channelType === 'D'
   const mentionedExplicitly = mentionedIds.includes(botId)
   const isWatchedChannel = listenChannelIds.has(post.channel_id)
+  const isBotThreadFollowUp = post.root_id !== '' && botThreads.has(post.root_id)
 
-  if (!isDM && !mentionedExplicitly && !isWatchedChannel) return
+  if (!isDM && !mentionedExplicitly && !isWatchedChannel && !isBotThreadFollowUp) return
 
   if (!isApproved(post.user_id)) {
     if (isDM) await offerPairing(post)
