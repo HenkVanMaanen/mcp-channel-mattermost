@@ -255,11 +255,24 @@ longer auto-forward, ask Claude to call `clear_thread_state` with the
 ### `reply`
 
 ```ts
-reply({ channel_id, message, root_id? })
+reply({ channel_id, message?, root_id?, attachments? })
 ```
 
 Posts a message back to Mattermost. To reply in-thread, pass `root_id` (use
 `root_id` from the inbound tag if non-empty, otherwise `post_id`).
+
+To attach files, pass `attachments` as an array of `{ path, filename? }`:
+the bot reads each local file, uploads it to Mattermost, and attaches the
+resulting file IDs to the post. Either `message` or `attachments` must be
+non-empty. Mattermost caps a single post at 10 attachments.
+
+```ts
+reply({
+  channel_id: '...',
+  message: 'screenshot attached',
+  attachments: [{ path: '/tmp/screenshot.png' }],
+})
+```
 
 ### `read_thread`
 
