@@ -9,7 +9,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { basename, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { z } from 'zod'
 
@@ -119,11 +119,45 @@ const getChannel = (id: string) => mm<MMChannel>(`/channels/${id}`)
 const getChannelByName = (team: string, name: string) =>
   mm<MMChannel>(`/teams/name/${encodeURIComponent(team)}/channels/name/${encodeURIComponent(name)}`)
 
-async function postMessage(channel_id: string, message: string, root_id?: string): Promise<MMPost> {
+async function postMessage(
+  channel_id: string,
+  message: string,
+  root_id?: string,
+  file_ids?: string[],
+): Promise<MMPost> {
   return mm<MMPost>('/posts', {
     method: 'POST',
-    body: JSON.stringify({ channel_id, message, ...(root_id ? { root_id } : {}) }),
+    body: JSON.stringify({
+      channel_id,
+      message,
+      ...(root_id ? { root_id } : {}),
+      ...(file_ids && file_ids.length > 0 ? { file_ids } : {}),
+    }),
   })
+}
+
+type MMFileInfo = { id: string; name: string }
+type MMFileUploadResponse = { file_infos: MMFileInfo[] }
+
+async function uploadFile(channel_id: string, path: string, filename?: string): Promise<MMFileInfo> {
+  const bytes = await readFile(path)
+  const name = filename ?? basename(path)
+  const form = new FormData()
+  form.append('channel_id', channel_id)
+  form.append('files', new Blob([new Uint8Array(bytes)]), name)
+  const r = await fetch(`${MATTERMOST_URL}/api/v4/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` },
+    body: form,
+  })
+  if (!r.ok) {
+    const body = await r.text().catch(() => '')
+    throw new Error(`Mattermost POST /files: ${r.status} ${body}`)
+  }
+  const data = (await r.json()) as MMFileUploadResponse
+  const info = data.file_infos?.[0]
+  if (!info?.id) throw new Error(`upload of ${name} returned no file_infos`)
+  return info
 }
 
 async function openDirectChannel(otherUserId: string): Promise<MMChannel> {
@@ -292,15 +326,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Send a message back to a Mattermost channel or DM. ' +
         'Pass channel_id from the inbound <channel> tag. ' +
-        'To thread the reply, pass root_id (the inbound root_id if non-empty, otherwise post_id).',
+        'To thread the reply, pass root_id (the inbound root_id if non-empty, otherwise post_id). ' +
+        'Pass attachments to upload local files and attach them to the post (up to 10 per post, ' +
+        'Mattermost server limit).',
       inputSchema: {
         type: 'object',
         properties: {
           channel_id: { type: 'string', description: 'Mattermost channel ID from the inbound <channel> tag' },
-          message: { type: 'string', description: 'Message body (Markdown supported)' },
+          message: { type: 'string', description: 'Message body (Markdown supported). May be empty when attachments are provided.' },
           root_id: { type: 'string', description: 'Optional thread root post ID' },
+          attachments: {
+            type: 'array',
+            description: 'Local files to upload and attach to the post.',
+            items: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Absolute or working-dir-relative path to a local file the bot can read' },
+                filename: { type: 'string', description: 'Optional filename to show in Mattermost (defaults to basename of path)' },
+              },
+              required: ['path'],
+            },
+          },
         },
-        required: ['channel_id', 'message'],
+        required: ['channel_id'],
       },
     },
     {
@@ -357,12 +405,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const channel_id = String(args.channel_id ?? '')
     const message = String(args.message ?? '')
     const root_id = args.root_id ? String(args.root_id) : undefined
-    if (!channel_id || !message) {
-      return { content: [{ type: 'text', text: 'channel_id and message are required' }], isError: true }
+    const rawAttachments = Array.isArray(args.attachments) ? args.attachments : []
+    const attachments = rawAttachments
+      .map(a => (a && typeof a === 'object' ? a as { path?: unknown; filename?: unknown } : null))
+      .filter((a): a is { path?: unknown; filename?: unknown } => a !== null)
+      .map(a => ({
+        path: typeof a.path === 'string' ? a.path : '',
+        filename: typeof a.filename === 'string' ? a.filename : undefined,
+      }))
+      .filter(a => a.path !== '')
+    if (!channel_id) {
+      return { content: [{ type: 'text', text: 'channel_id is required' }], isError: true }
+    }
+    if (!message && attachments.length === 0) {
+      return { content: [{ type: 'text', text: 'message or attachments is required' }], isError: true }
     }
     try {
-      const post = await postMessage(channel_id, message, root_id)
-      return { content: [{ type: 'text', text: `posted ${post.id}` }] }
+      const fileInfos = await Promise.all(
+        attachments.map(a => uploadFile(channel_id, a.path, a.filename)),
+      )
+      const file_ids = fileInfos.map(f => f.id)
+      const post = await postMessage(channel_id, message, root_id, file_ids)
+      const suffix = file_ids.length > 0 ? ` with ${file_ids.length} attachment${file_ids.length === 1 ? '' : 's'}` : ''
+      return { content: [{ type: 'text', text: `posted ${post.id}${suffix}` }] }
     } catch (e) {
       return { content: [{ type: 'text', text: `post failed: ${(e as Error).message}` }], isError: true }
     }
