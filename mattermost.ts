@@ -283,7 +283,7 @@ function purgeExpiredPairings() {
 // --- MCP server ------------------------------------------------------------
 
 const mcp = new Server(
-  { name: 'mattermost', version: '0.2.0' },
+  { name: 'mattermost', version: '0.3.0' },
   {
     capabilities: {
       experimental: {
